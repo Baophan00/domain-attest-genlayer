@@ -3,86 +3,125 @@
 Prove control of a domain, on chain, without a keeper.
 
 An agent that claims "I am example.com's bot" is worth exactly as much as the person who typed it.
-DomainAttest turns the sentence into something checkable: an address publishes a random token into a
-file on the domain it claims, and anyone may ask the GenLayer validator set to fetch that file and
-compare the token character for character. The result is a public, expiring mapping from domain to
+DomainAttest turns the sentence into something checkable: the contract mints a fresh challenge, the
+claimant plants it at a fixed path on the domain, and the GenLayer validator set fetches that file and
+compares its whole content with the challenge. The result is a public, expiring mapping from domain to
 address that other contracts and agents can read before they trust a handle.
 
-## Why this needs GenLayer, and why it does not need a model
+## Why the challenge comes from the contract
 
-The comparison is a string match, so nothing here is a judgement call: the contract uses
-`gl.eq_principle.strict_eq`, which means every validator runs the same comparison on the page it
-fetched itself. That is the interesting part — a proof of control is exactly the case where an LLM
-would be a liability, and GenLayer still needs consensus because the input is a live web page that no
-single server can be trusted to report.
+A claimant who types their own proof string can pick one that already sits somewhere on a public page
+(a playlist, a comment, a paste) and point the proof at that page. So `register` takes a domain and
+nothing else. The contract mints
 
-Attestations expire after 30 days. An address keeps a domain only while it can keep the file there, and
-anyone may re-verify, so a domain that changed hands stops vouching for its old owner without an
-arbitrator.
+```
+genlayer-domain-attest:v1:<domain>:<claimant>:<sequence>
+```
+
+where the sequence number moves on every claim, and it fixes the single path the value must live at:
+
+```
+https://<domain>/.well-known/genlayer-domain-attest.txt
+```
+
+A value that only exists after the claim was made cannot have been planted in advance, and a path the
+contract chooses cannot be aimed at a page the claimant happens to own already.
+
+## Why the comparison is exact, and why no model is involved
+
+The file must hold the challenge and nothing else. "The token appears somewhere on this page" is not
+proof of control of the page, so the rule is string equality after trimming surrounding whitespace.
+Because the verdict is a string comparison, the contract uses `gl.eq_principle.strict_eq`: every
+validator runs the same comparison on the file it fetched itself. This is the case where an LLM would
+be a liability, and GenLayer is still needed, because the input is a live web page no single server can
+be trusted to report.
+
+## Why a failed fetch revokes nothing
+
+A timeout, a 503, a WAF block page, an empty body or a validator outage says nothing about who controls
+a domain. Only a file that was read successfully and holds the wrong value moves an attestation to
+`failed`. Anything else leaves the status and the expiry exactly as they were and records what happened
+in `last_outcome` (`unreachable`, `unreadable page`).
+
+The same reasoning decides who may ask: while an attestation is valid, only its owner can trigger a
+re-verification, so no passer-by can knock a live mapping down. While a claim is unfinished, only the
+claimant can complete it. After expiry anyone may claim or verify, which is what keeps a domain that
+changed hands from being stuck.
+
+An unfinished claim stops blocking others after 24 hours. A verified attestation lasts 30 days and then
+stops vouching for its old owner on its own.
 
 ## Live
 
-- Contract (Studio Network): `0xd618d594805685eA891a37d052bAC8D8143F652b`
-- Explorer: https://explorer-studio.genlayer.com/address/0xd618d594805685eA891a37d052bAC8D8143F652b
+- Contract (Studio Network): `0x113c01e16e6a923B5Bb5BdB5B38c7566df04D755`
+- Explorer: https://explorer-studio.genlayer.com/address/0x113c01e16e6a923B5Bb5BdB5B38c7566df04D755
 
 ## Runs on the live contract
 
 | what | transaction |
 | --- | --- |
-| deploy `0xd618d594805685eA891a37d052bAC8D8143F652b` | `0xbece4f9daf04791f6978e43ff1545c42c86cf0ddc6c74ddfea51dc1c8dccea95` |
-| register `claimwatch-genlayer.surge.sh` (token really served there) | `0xdcecf984ed555ad6e2af6a25daa2652489887b05a5132d7fefe1fa699637845e` |
-| register `example.com` with a token planted nowhere | `0xf24e8f207ccd7ea32a8c934683f034e65be4eb4bd87b3b0831bc01a9cb003587` |
-| verify the real one → `verified`, valid for 30 days (44s) | `0xb5a892c378bce516fb21f4629c0185ad6b9bf2815d8e2f2e3cc63be155c8ca41` |
-| verify the planted-nowhere one → `failed` (44s) | `0x30ba2f36231862e33247324e0e7d3b1c5ac050b46a74d634865e4ce3cf2affb4` |
+| deploy `0x113c01e16e6a923B5Bb5BdB5B38c7566df04D755` | `0xb5cd5594c5db24200ed9deda58b77910655a3e72d177c125b4e441aad59d208f` |
+| register `attest-demo-dusky.vercel.app` → challenge seq 1 | `0xaee81fa47a59f61a1dcaaa53083fd1e881e46c429a5bf6104406bfa30eab66a5` |
+| register `attest-stale.vercel.app` → challenge seq 2 | `0xe921fede1af65bdf4aa96527753679aa1190d7dd57211c89ba8241245173e9db` |
+| verify the host whose well-known file holds the challenge → `verified`, 30 days (45s) | `0x347b27d75535d8c3e53db8a5a66f565f461dad8ae30544f584fa4f3d03e5fa91` |
+| verify the host whose file holds an older value → `failed` (40s) | `0x56c5e7297caa36ed8dd534447308fb4301ef3f66ad956dfab743ff935e72b5c8` |
+| a stranger re-verifying the live attestation → refused by the contract | `0xec1f8f1172151f417ff6ce59e0745e359747eb21d3881067cfb0e85bbb02e014` |
 
-The token is live at https://claimwatch-genlayer.surge.sh/attest.txt and the run ends with
-`is_valid("claimwatch-genlayer.surge.sh") == true` and `is_valid("example.com") == false`.
+The run ends with `is_valid("attest-demo-dusky.vercel.app") == true`,
+`is_valid("attest-stale.vercel.app") == false`, and `stats()` reporting two domains: one verified, one
+failed.
+
+Proof files:
+
+- `https://attest-demo-dusky.vercel.app/.well-known/genlayer-domain-attest.txt` holds
+  `genlayer-domain-attest:v1:attest-demo-dusky.vercel.app:0xcff6f547ffbe4ce345dcbd5dff429ee344941a3d:1`
+- `https://attest-stale.vercel.app/.well-known/genlayer-domain-attest.txt` holds the same line ending
+  in `:0`, an earlier value for the same claimant, so exact equality rejects it: the page is reachable,
+  readable, and wrong.
 
 ## The flow
 
-1. `register(domain, token, proof_path)` — the sender claims a domain and states the token it planted at
-   `https://<domain><proof_path>`. The domain is normalised to lower case and must be a bare host name.
-2. `verify(domain)` — anyone may call it. Validators fetch the proof URL and compare the token; the
-   attestation becomes `verified` with a 30 day expiry, or `failed`. A failed attempt can be retried.
-3. `get_attest(domain)` — status, owner, expiry, attempts, and a computed `valid` that already accounts
-   for expiry.
-4. `is_valid(domain)` — the one call another contract needs: is this domain attested to a live owner now.
-5. `of_owner(address)`, `list_domains(offset, limit)`, `domain_count()`, `stats()`.
-
-A verified domain cannot be taken while it is valid; once it expires, anyone may register it, and a
-`pending` claim does not block a later one.
+1. `register(domain)` — normalises the domain (lower case, trailing dot dropped, bare host name) and
+   returns the challenge to plant plus the URL to plant it at. The sender becomes the claimant.
+2. `challenge_of(domain)` — the same two values, for whoever plants the file.
+3. `verify(domain)` — validators fetch the proof file and compare its whole content with the challenge.
+   A match sets `verified` for 30 days, a mismatch sets `failed`, a fetch that did not work changes
+   nothing.
+4. `get_attest(domain)` — challenge, status, owner, expiry, attempts, `last_outcome`, and a computed
+   `valid` that already accounts for expiry.
+5. `is_valid(domain)` — the one call another contract needs: is this domain attested to a live owner now.
+6. `of_owner(address)`, `list_domains(offset, limit)`, `domain_count()`, `stats()`.
 
 ## Contract surface
 
 | kind | name |
 | --- | --- |
 | write | `register`, `verify` |
-| view | `get_attest`, `is_valid`, `of_owner`, `list_domains`, `domain_count`, `stats` |
+| view | `get_attest`, `challenge_of`, `is_valid`, `of_owner`, `list_domains`, `domain_count`, `stats` |
 
-## Deploy and run
-
-```bash
-npm install
-node scripts/deploy_studionet.js
-node scripts/e2e_studionet.js 0xd618d594805685eA891a37d052bAC8D8143F652b <token>
-```
-
-The e2e script takes the token that is live on the surge host, registers one domain with it and one
-with a token that exists nowhere, verifies both, and fails loudly unless the first is `verified` and
-the second is `failed`.
+`register` takes no token and no path: both are the contract's to decide.
 
 ## Tests
 
-Fourteen direct-mode tests, no network:
-
-```bash
-python -m pytest tests/direct -q     # 14 passed
+```
+python -m pytest tests/direct -q     # 24 passed
 ```
 
-They cover registration rules (bare host, token length, absolute proof path, case folding, id reuse),
-the verify path (token present, token absent, an unreadable 404 landing as `failed` rather than
-passing, retry after failure, permissionless re-verification), and ownership: a valid attestation cannot
-be taken, expiry frees the domain, and `of_owner` / `list_domains` return what they claim to.
+They cover the challenge being contract-minted and fresh per claim, exact equality rejecting a page
+that merely mentions the value, a pending claim that cannot be taken over, an abandoned claim that
+frees after a day, a stranger refused on a live attestation, and a timeout, an error page or an empty
+body leaving a valid attestation and its expiry untouched.
+
+## Running the live halves
+
+```
+node scripts/deploy_studionet.js
+node scripts/e2e_studionet.js register <contract> <goodDomain> <staleDomain>
+# plant both proof files, then
+node scripts/e2e_studionet.js verify   <contract> <goodDomain> <staleDomain>
+```
+
+The split exists because the challenge has to be planted between the two halves.
 
 ## Layout
 
